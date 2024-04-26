@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <curl/curl.h>
 #include "base64.h"
+#include "rest_client_pool.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -26,11 +27,11 @@
 
 #define BUFFER_SIZE 1024
 #define ENCODE_SIZE 2048
-//#define SERVER_IP "114.116.239.178"  // The IP address of the server to connect with socket
-//#define SERVER_PORT 22          // The port of the server to connect with socket
+#define SERVER_IP "114.116.239.178"  // The IP address of the server to connect with socket
+#define SERVER_PORT 22          // The port of the server to connect with socket
 
-#define SERVER_IP "198.18.0.63"
-#define SERVER_PORT 80
+//#define SERVER_IP "198.18.0.63"
+//#define SERVER_PORT 80
 
 void initialize_curl() {
     curl_global_init(CURL_GLOBAL_ALL);
@@ -57,19 +58,21 @@ size_t write_data(void *ptr, size_t size, size_t nmemb, void *userp) {
     return real_size;
 }
 
-int http_get(const char *url, char *response) {
-    CURL *curl = curl_easy_init();
+int http_get(CURL *curl, const char *url, char *response) {
     if (curl) {
         ResponseData resp_data = {response, 0};
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_data);
         curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
 
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             fprintf(stderr, "GET request failed: %s\n", curl_easy_strerror(res));
-            curl_easy_cleanup(curl);
+            //curl_easy_cleanup(curl);
             return -1;
         }
         if (res == CURLE_OK) {
@@ -88,17 +91,16 @@ int http_get(const char *url, char *response) {
 
             memcpy(response, decoded_data, decoded_size);
             free(decoded_data);
-            curl_easy_cleanup(curl);
+            //curl_easy_cleanup(curl);
             return (int)decoded_size;  // 返回解码后的实际大小
         }
-
+//        return_curl(pool, curl);
     }
     return -1;
 }
 
 // 修改 POST 函数来传递二进制数据的长度
-void http_post(const char *url, const char *data, int len) {
-    CURL *curl = curl_easy_init();
+void http_post(CURL *curl, const char *url, const char *data, int len) {
     if (curl) {
         char *encoded_data = base64_encode((const unsigned char *)data, len);
         if (encoded_data == NULL) {
@@ -107,15 +109,18 @@ void http_post(const char *url, const char *data, int len) {
             curl_easy_setopt(curl, CURLOPT_URL, url);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, encoded_data);
             curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
 
             CURLcode res = curl_easy_perform(curl);
             if (res != CURLE_OK) {
                 fprintf(stderr, "POST request failed: %s\n", curl_easy_strerror(res));
             }
-
+            //curl_easy_cleanup(curl);
             free(encoded_data);  // Clean up the encoded data
         }
-        curl_easy_cleanup(curl);
+//        return_curl(pool, curl);
     }
 }
 
@@ -156,6 +161,14 @@ int main() {
     printf("Get connection success,%d\n", sock);
     fd_set read_fds;
     int max_fd = sock;
+    CurlPool *pool = curl_pool_init();
+    if (pool == NULL) {
+        fprintf(stderr, "Failed to create curl pool\n");
+        return 0;
+    }
+    CURL *recvcurl = get_curl(pool);
+    CURL *sendcurl = get_curl(pool);
+
 
     // Main loop: Get data via HTTP GET, send via socket, and POST response
     while (1) {
@@ -163,30 +176,30 @@ int main() {
         FD_SET(sock, &read_fds);
         struct timeval timeout;
         timeout.tv_sec = 0;      // 秒数
-        timeout.tv_usec = 200000; // 微秒数（200毫秒）
+        timeout.tv_usec = 2000; // 微秒数（2毫秒）
         select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
 
-            // HTTP GET
-            int bytes_read = http_get("http://127.0.0.1:8089/recv?client_id=8688bb89-5ace-48b1-a158-dfe154429b27", encode_buffer);
+        // HTTP GET
+        int bytes_read = http_get(recvcurl, "http://127.0.0.1:8089/recv?client_id=8688bb89-5ace-48b1-a158-dfe154429b27", encode_buffer);
 
-            // Send to server via socket
+        // Send to server via socket
         if(bytes_read > 0){
-            unsigned char u_encode_buffer[ENCODE_SIZE];
-            for (int i = 0; i < ENCODE_SIZE; i++) {
-                u_encode_buffer[i] = (unsigned char)encode_buffer[i];
-            }
-            if (send(sock, u_encode_buffer, bytes_read, 0) < 0) {
+//            unsigned char u_encode_buffer[ENCODE_SIZE];
+//            for (int i = 0; i < ENCODE_SIZE; i++) {
+//                u_encode_buffer[i] = (unsigned char)encode_buffer[i];
+//            }
+            if (send(sock, encode_buffer, bytes_read, 0) < 0) {
                 perror("Failed to send data");
                 PRINTLASTERROR;
                 break;
             }
-            printf("\n\nrecv from client %d bytes:\n%.*s\n, send to remote\n", bytes_read, bytes_read, u_encode_buffer);
+            printf("\n\nrecv from client %d bytes, send to remote\nraw:\n", bytes_read);
             for(int i = 0; i < bytes_read; i++) {
-                printf("%02X ", u_encode_buffer[i]);
+                printf("%02X ", (unsigned char)encode_buffer[i]);
             }
         }
 
-            // Receive from remote
+        // Receive from remote
         if (FD_ISSET(sock, &read_fds)) {
             int len = recv(sock, buffer, BUFFER_SIZE, 0);
             if (len <= 0) {
@@ -195,13 +208,13 @@ int main() {
                 break;
             }
             // HTTP POST
-            http_post("http://127.0.0.1:8089/send?client_id=8688bb89-5ace-48b1-a158-dfe154429b27", buffer, len);
-            printf("\n\nrecv from remote %d bytes:\n%.*s\n, send to client\n", len, len, buffer);
+            http_post(sendcurl, "http://127.0.0.1:8089/send?client_id=8688bb89-5ace-48b1-a158-dfe154429b27", buffer, len);
+            printf("\n\nrecv from remote %d bytes, send to client\nraw:\n", len);
             for(int i = 0; i < len; i++) {
                 printf("%02X ", buffer[i]);
             }
 
-       }
+        }
 
     }
 

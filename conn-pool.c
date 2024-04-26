@@ -102,11 +102,17 @@ void release_connection(struct connection_info* connection) {
 
 size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
     struct req_data *req_data = (struct req_data *)userdata;
-    size_t numbytes = size * nitems;
+    if (req_data == NULL || req_data->conn_info == NULL) {
+        printf("Invalid request data or connection info\n");
+        return 0;  // 提前返回，避免后续空指针解引用
+    }
 
-    if (strncasecmp(buffer, "X-Request-ID:", 13) == 0) {
+    size_t numbytes = size * nitems;
+    //printf("Received header: %.*s", (int)numbytes, buffer);  // 打印接收到的整个header
+    //initialize_connection_pool();
+    if (strncasecmp(buffer, "X-Request-Id:", 13) == 0) {
         char *id_start = buffer + 13;
-        while (*id_start == ' ') id_start++;
+        while (*id_start == ' ') id_start++;  // 跳过键名后的空格
 
         char *id_end = strstr(id_start, "\r\n");
         if (id_end) {
@@ -114,12 +120,15 @@ size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata)
             if (id_length < sizeof(req_data->conn_info->request_id)) {
                 strncpy(req_data->conn_info->request_id, id_start, id_length);
                 req_data->conn_info->request_id[id_length] = '\0'; // 确保字符串结束
+                printf("Extracted request id: %s\n", req_data->conn_info->request_id);
             }
+        } else {
+            printf("End of request ID not found\n");
         }
     }
-    printf("Get request id: %s", req_data->conn_info->request_id);
     return numbytes;
 }
+
 
 // 发送数据到HTTP服务器并设置X-Request-ID
 void post_data_to_server(const char *data, size_t data_size, const char *url, const char *request_id) {
@@ -136,11 +145,13 @@ void post_data_to_server(const char *data, size_t data_size, const char *url, co
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)data_size);
-
+        printf("sending result...\n");
         res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+            fprintf(stderr, "curl_easy_perform()1 failed: %s\n", curl_easy_strerror(res));
         }
         curl_easy_cleanup(curl);
         curl_slist_free_all(headers);
@@ -151,37 +162,55 @@ void post_data_to_server(const char *data, size_t data_size, const char *url, co
 
 size_t write_data(void *buffer, size_t size, size_t nmemb, void *userp) {
     struct req_data *data = (struct req_data *)userp;
-    if (data->conn_info == NULL) {
-        data->conn_info = get_connection(data->conn_info->request_id);
+    if (data == NULL || data->conn_info == NULL) {
+        fprintf(stderr, "Invalid connection data\n");
+        return 0;  // 返回0会导致curl处理失败
     }
-    if (data->conn_info != NULL) {
-        size_t total_size = size * nmemb;
-        char response_buffer[4096];  // 假设最大响应大小
-        ssize_t recv_size;
 
-        pthread_mutex_lock(&data->conn_info->lock);
-        printf("Forwarding...\n");
-        send(data->conn_info->sock, buffer, total_size, 0);  // 发送数据到SOCKS5服务
-        recv_size = recv(data->conn_info->sock, response_buffer, sizeof(response_buffer), 0);  // 接收响应
-        pthread_mutex_unlock(&data->conn_info->lock);
+    size_t total_size = size * nmemb;
+    char response_buffer[4096];  // 假设最大响应大小
+    ssize_t recv_size;
 
-        if (recv_size > 0) {
-            post_data_to_server(response_buffer, recv_size, "https://127.0.0.1/reserve", data->conn_info->request_id);
-            return total_size;
+    pthread_mutex_lock(&data->conn_info->lock);
+    printf("Forwarding...\n");
+    send(data->conn_info->sock, buffer, total_size, 0);  // 发送数据到SOCKS5服务
+    recv_size = recv(data->conn_info->sock, response_buffer, sizeof(response_buffer), 0);  // 接收响应
+    pthread_mutex_unlock(&data->conn_info->lock);
+
+    if (recv_size > 0) {
+        post_data_to_server(response_buffer, recv_size, "https://127.0.0.1/reserve", data->conn_info->request_id);
+        return total_size;
+    }
+    return total_size;  // 即使没有接收到数据也返回处理的大小，避免curl误解为写入失败
+}
+
+
+struct connection_info* find_unused_connection() {
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connection_pool[i].in_use == 0) {
+            connection_pool[i].in_use = 1;  // Mark as in use
+            connection_pool[i].sock = create_socket();
+            return &connection_pool[i];
         }
     }
-    return 0;  // 发生错误时返回0
+    return NULL;
 }
 
 int main() {
     init_network();
-    initialize_connection_pool();
 
     CURL *curl = curl_easy_init();
+
     if (curl) {
-        struct req_data data = {0};
+        struct connection_info* conn_info = find_unused_connection();
+        if (conn_info == NULL) {
+            fprintf(stderr, "No available connection.\n");
+            return EXIT_FAILURE;
+        }
+        struct req_data data = { conn_info };
 
         curl_easy_setopt(curl, CURLOPT_URL, "https://127.0.0.1/tunnel");
+//        curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -189,14 +218,17 @@ int main() {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
 
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
 
-        CURLcode res = curl_easy_perform(curl);
-        if(res != CURLE_OK) {
-            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-        }
+
+            CURLcode res = curl_easy_perform(curl);
+            if(res != CURLE_OK) {
+                fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+            }
+
+
         curl_easy_cleanup(curl);
     }
 
