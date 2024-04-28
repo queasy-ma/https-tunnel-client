@@ -58,7 +58,7 @@ void http_post(){
 
     curl_pool_cleanup(pool);
     return ;
-    }
+}
 
 
 int main(void) {

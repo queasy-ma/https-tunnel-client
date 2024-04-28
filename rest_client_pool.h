@@ -21,5 +21,7 @@ void curl_pool_cleanup(CurlPool *pool);
 CURL* get_curl(CurlPool *pool);
 void return_curl(CurlPool *pool, CURL *curl);
 size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata);
+//size_t write_callback(void *buffer, size_t size, size_t nmemb, void *userp);
 void perform_post_request(CurlPool *pool, const char *url, const char *post_data);
+void perform_get_request(CurlPool *pool,const char *url);
 #endif //HTTPS_TUNNEL_CLIENT_REST_CLIENT_POOL_H

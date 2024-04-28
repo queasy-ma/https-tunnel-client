@@ -70,7 +70,7 @@ void perform_post_request(CurlPool *pool, const char *url, const char *post_data
 
         res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
-            printf("Response: %s\n", response);
+//            printf("Response: %s\n", response);
         } else {
             fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
         }
@@ -80,3 +80,35 @@ void perform_post_request(CurlPool *pool, const char *url, const char *post_data
         fprintf(stderr, "Unable to get curl handle\n");
     }
 }
+
+// 写回调函数处理从服务器接收到的数据
+//size_t write_callback(void *buffer, size_t size, size_t nmemb, void *userp) {
+//    size_t real_size = size * nmemb;
+//    printf("Received from server: %.*s", (int)real_size, (char *)buffer);
+//    return real_size;
+//}
+
+//void perform_get_request(CurlPool *pool,const char *url) {
+//    CURL *curl = get_curl(pool);
+//    CURLcode res;
+//    struct curl_slist *headers = NULL;
+//
+//    if (curl) {
+//        curl_easy_setopt(curl, CURLOPT_URL, url);
+////        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+//        // 设置自定义的写回调函数
+//        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+//
+//        curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+//
+//        // 发送 POST 请求并接收响应
+//        res = curl_easy_perform(curl);
+//        if (res != CURLE_OK) {
+//            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+//        }
+//        return_curl(pool, curl);
+//    }
+//}
