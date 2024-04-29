@@ -27,11 +27,16 @@
 
 #define BUFFER_SIZE 1024
 #define ENCODE_SIZE 2048
-#define SERVER_IP "114.116.239.178"  // The IP address of the server to connect with socket
-#define SERVER_PORT 22          // The port of the server to connect with socket
 
-//#define SERVER_IP "198.18.0.63"
-//#define SERVER_PORT 80
+
+//#define SERVER_IP "114.116.239.178"  // The IP address of the server to connect with socket
+//#define SERVER_PORT 22          // The port of the server to connect with socket
+
+#define SERVER_IP "198.18.0.102"
+#define SERVER_PORT 80
+
+//#define SERVER_IP "127.0.0.1"
+//#define SERVER_PORT 8888
 
 void initialize_curl() {
     curl_global_init(CURL_GLOBAL_ALL);
@@ -101,11 +106,11 @@ typedef struct {
 //}
 
 // 默认缓冲区大小
-#define DEFAULT_BUFFER_SIZE 1024
+#define MAX_STATIC_SIZE 1024
 
 struct MemoryStruct {
-    char memory[DEFAULT_BUFFER_SIZE];  // 静态数组，不需要动态分配
-    char *dynamic_memory;  // 超过默认大小时使用的动态分配内存
+    char static_memory[MAX_STATIC_SIZE];
+    char *dynamic_memory;
     size_t size;
 };
 
@@ -113,34 +118,37 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     size_t realsize = size * nmemb;
     struct MemoryStruct *mem = (struct MemoryStruct *)userp;
 
-    // 计算接收到的数据和已有数据的总大小
-    size_t total_size = mem->size + realsize;
-
-    // 检查是否需要动态分配内存
-    if (total_size > DEFAULT_BUFFER_SIZE) {
-        // 判断是否已经分配了动态内存
+    if (mem->size + realsize <= MAX_STATIC_SIZE) {
+        // 使用静态缓冲区存储数据
+        memcpy(&(mem->static_memory[mem->size]), contents, realsize);
+    } else {
         if (!mem->dynamic_memory) {
-            // 首次动态分配内存
-            mem->dynamic_memory = malloc(total_size + 1);
-            // 将已有数据从静态内存复制到动态内存
-            memcpy(mem->dynamic_memory, mem->memory, mem->size);
+            // 需要首次分配动态内存
+            mem->dynamic_memory = malloc(mem->size + realsize + 1);
+            if (mem->dynamic_memory == NULL) {
+                fprintf(stderr, "Failed to allocate memory.\n");
+                return 0;  // 内存不足时中止操作
+            }
+            memcpy(mem->dynamic_memory, mem->static_memory, mem->size);  // 复制已有的静态数据到动态内存中
         } else {
-            // 已有动态内存，需要调整大小
-            char *ptr = realloc(mem->dynamic_memory, total_size + 1);
+            // 重新分配更多内存
+            char *ptr = realloc(mem->dynamic_memory, mem->size + realsize + 1);
             if (ptr == NULL) {
-                printf("内存不足 (realloc 返回 NULL)\n");
-                return 0;
+                fprintf(stderr, "Failed to reallocate memory.\n");
+                return 0;  // 内存不足时中止操作
             }
             mem->dynamic_memory = ptr;
         }
-        // 将新数据写到动态内存
-        memcpy(mem->dynamic_memory, contents, realsize);
-    } else {
-        // 如果没有超出默认缓冲区大小，直接复制到静态数组
-        memcpy(mem->memory, contents, realsize);
+        memcpy(&(mem->dynamic_memory[mem->size]), contents, realsize);
     }
 
-    mem->size = total_size;
+    mem->size += realsize;
+    if (mem->dynamic_memory) {
+        mem->dynamic_memory[mem->size] = 0;
+    } else {
+        mem->static_memory[mem->size] = 0;
+    }
+
     return realsize;
 }
 
@@ -150,7 +158,8 @@ int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
-        curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
@@ -175,12 +184,13 @@ void http_post(CURL *curl, const char *url, const char *data, int len) {
 //        } else {
             curl_easy_setopt(curl, CURLOPT_URL, url);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
-            curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
+           //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+            curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
         // 设置HTTP头部，指明内容类型为二进制流
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
@@ -258,7 +268,7 @@ int main() {
         //select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
 
         // HTTP GET
-        int bytes_read = http_get(recvcurl, "http://127.0.0.1:8089/recv?client_id=8688bb89-5ace-48b1-a158-dfe154429b27",
+        int bytes_read = http_get(recvcurl, "http://65.20.66.51:8089/recv?client_id=8688bb89-5ace-48b1-a158-dfe154429b27",
                                   &chunk);
         // Send to server via socket
         if (bytes_read > 0) {
@@ -268,18 +278,21 @@ int main() {
                     PRINTLASTERROR;
                     break;
                 }
+//                printf("\n\nrecv from client %d bytes, send to remote\nraw:\n", bytes_read);
+//                for (int i = 0; i < bytes_read; i++) {
+//                    printf("%02X ", (unsigned char) chunk.dynamic_memory[i]);
+//                }
                 free(chunk.dynamic_memory);
                 chunk.size = 0;
                 chunk.dynamic_memory = NULL;
             } else {
-                if (send(sock, chunk.memory, bytes_read, 0) < 0) {
+                if (send(sock, chunk.static_memory, bytes_read, 0) < 0) {
                     perror("Failed to send data");
                     PRINTLASTERROR;
                     break;
                 }
                 chunk.size = 0;
                 chunk.dynamic_memory = NULL;
-
             }
 
             printf("\nrecv from client %d bytes, send to remote", bytes_read);
@@ -342,7 +355,7 @@ int main() {
             }
 
             if (data_size > 0 && data_buffer != NULL) {
-                http_post(sendcurl, "http://127.0.0.1:8089/send?client_id=8688bb89-5ace-48b1-a158-dfe154429b27", data_buffer, data_size);
+                http_post(sendcurl, "http://65.20.66.51:8089/send?client_id=8688bb89-5ace-48b1-a158-dfe154429b27", data_buffer, data_size);
                 printf("\nrecv from remote %d bytes, send to client", data_size);
 
 //                printf("\n\nrecv from remote %d bytes, send to client\nraw:\n", data_size);
