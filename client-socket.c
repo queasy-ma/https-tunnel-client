@@ -10,6 +10,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <io.h>
+#include <process.h>
 #include <windows.h>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -22,6 +23,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/select.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #endif
 #define PRINTLASTERROR printf("WSAGetLastError: %d\n", WSAGetLastError())
 
@@ -32,11 +35,16 @@
 //#define SERVER_IP "114.116.239.178"  // The IP address of the server to connect with socket
 //#define SERVER_PORT 22          // The port of the server to connect with socket
 
-#define SERVER_IP "198.18.0.102"
-#define SERVER_PORT 80
+//#define SERVER_IP "198.18.0.102"
+//#define SERVER_PORT 80
 
 //#define SERVER_IP "127.0.0.1"
 //#define SERVER_PORT 8888
+#define MAX_URL_LENGTH 130
+char *SERVER_ADDRESS = "127.0.0.1";
+int SERVER_PORT = 443;
+
+
 
 void initialize_curl() {
     curl_global_init(CURL_GLOBAL_ALL);
@@ -50,6 +58,14 @@ typedef struct {
     char  *buffer;
     size_t size;
 } ResponseData;
+
+typedef struct {
+    char *uuid;
+    CurlPool *pool; // 替换为正确的类型，如果它是一个结构体
+    char *target_ip;
+    unsigned short target_port;
+} ConnectionArgs;
+
 
 //base64解码版本
 //size_t write_data(void *ptr, size_t size, size_t nmemb, void *userp) {
@@ -159,7 +175,7 @@ int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
         //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
-        curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
+        //curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
@@ -186,7 +202,7 @@ void http_post(CURL *curl, const char *url, const char *data, int len) {
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
            //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
-            curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
+            //curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
@@ -207,17 +223,12 @@ void http_post(CURL *curl, const char *url, const char *data, int len) {
     }
 }
 
-int main() {
+
+void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short target_port){
     int sock;
     struct sockaddr_in server_addr;
-    char  encode_buffer[ENCODE_SIZE];
     unsigned char  buffer[BUFFER_SIZE] ;
 
-
-#ifdef _WIN32
-    WSADATA wsa_data;
-    WSAStartup(MAKEWORD(2, 2), &wsa_data);
-#endif
 
     initialize_curl();
 
@@ -226,34 +237,35 @@ int main() {
     if (sock < 0) {
         perror("Socket creation failed");
         PRINTLASTERROR;
-        exit(EXIT_FAILURE);
+        return;
     }
 
     // Configure the server address
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
-    server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    server_addr.sin_port = htons(target_port);
+    server_addr.sin_addr.s_addr = inet_addr(tartget_ip);
 
     // Connect to the server
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Connection failed");
         PRINTLASTERROR;
         close(sock);
-        exit(EXIT_FAILURE);
+        return;
     }
 
     printf("Get connection success,%d\n", sock);
     fd_set read_fds;
     int max_fd = sock;
-    CurlPool *pool = curl_pool_init();
     if (pool == NULL) {
         fprintf(stderr, "Failed to create curl pool\n");
-        return 0;
+        return;
     }
     CURL *recvcurl = get_curl(pool);
     CURL *sendcurl = get_curl(pool);
-
-
+    char RECV_URL[MAX_URL_LENGTH];
+    char SEND_URL[MAX_URL_LENGTH];
+    snprintf(RECV_URL, sizeof(RECV_URL), "http://%s:%d/recv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+    snprintf(SEND_URL, sizeof(SEND_URL), "http://%s:%d/send?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
     struct MemoryStruct chunk;
     chunk.dynamic_memory = NULL;
     chunk.size = 0;
@@ -268,7 +280,7 @@ int main() {
         //select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
 
         // HTTP GET
-        int bytes_read = http_get(recvcurl, "http://65.20.66.51:8089/recv?client_id=8688bb89-5ace-48b1-a158-dfe154429b27",
+        int bytes_read = http_get(recvcurl, RECV_URL,
                                   &chunk);
         // Send to server via socket
         if (bytes_read > 0) {
@@ -319,62 +331,245 @@ int main() {
 //                printf("%02X ", buffer[i]);
 //            }
 //        }
-            int data_capacity = 0;
-            int data_size = 0;
-            char* data_buffer = NULL;
+        int data_capacity = 0;
+        int data_size = 0;
+        char* data_buffer = NULL;
 
-            while (select(max_fd + 1, &read_fds, NULL, NULL, &timeout)) {
-                int recv_total = recv(sock, buffer, BUFFER_SIZE, 0);
-                if (recv_total > 0) {
-                    if (data_size + recv_total > data_capacity) {
-                        data_capacity = (data_size + recv_total) * 2;
-                        char *new_buffer = realloc(data_buffer, data_capacity);
-                        if (new_buffer == NULL) {
-                            perror("Failed to allocate buffer");
-                            free(data_buffer);
-                            exit(EXIT_FAILURE);
-                        }
-                        data_buffer = new_buffer;
-                    }
-                    memcpy(data_buffer + data_size, buffer, recv_total);
-                    data_size += recv_total;
-                } else if (recv_total == 0) {
-                    printf("Connection closed by the remote host.\n");
-                    PRINTLASTERROR;
-                    exit(EXIT_FAILURE);
-                } else {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // No more data available at the moment
-                        break;
-                    } else {
-                        perror("recv failed");
+        while (select(max_fd + 1, &read_fds, NULL, NULL, &timeout)) {
+            int recv_total = recv(sock, buffer, BUFFER_SIZE, 0);
+            if (recv_total > 0) {
+                if (data_size + recv_total > data_capacity) {
+                    data_capacity = (data_size + recv_total) * 2;
+                    char *new_buffer = realloc(data_buffer, data_capacity);
+                    if (new_buffer == NULL) {
+                        perror("Failed to allocate buffer");
                         free(data_buffer);
-                        exit(EXIT_FAILURE);
+                        return;
                     }
+                    data_buffer = new_buffer;
+                }
+                memcpy(data_buffer + data_size, buffer, recv_total);
+                data_size += recv_total;
+            } else if (recv_total == 0) {
+                printf("Connection closed by the remote host.\n");
+                PRINTLASTERROR;
+                return;
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // No more data available at the moment
+                    break;
+                } else {
+                    perror("recv failed");
+                    free(data_buffer);
+                    return;
                 }
             }
+        }
 
-            if (data_size > 0 && data_buffer != NULL) {
-                http_post(sendcurl, "http://65.20.66.51:8089/send?client_id=8688bb89-5ace-48b1-a158-dfe154429b27", data_buffer, data_size);
-                printf("\nrecv from remote %d bytes, send to client", data_size);
+        if (data_size > 0 && data_buffer != NULL) {
+            http_post(sendcurl, SEND_URL, data_buffer, data_size);
+            printf("\nrecv from remote %d bytes, send to client", data_size);
 
 //                printf("\n\nrecv from remote %d bytes, send to client\nraw:\n", data_size);
 //                for (int i = 0; i < data_size; i++) {
 //                    printf("%02X ", (unsigned char)data_buffer[i]);
 //                }
-                free(data_buffer);
-            }
-
-
+            free(data_buffer);
+        }
     }
 
-
     close(sock);
+    return_curl(pool, recvcurl);
+    return_curl(pool, sendcurl);
+
+}
+
+
+// 线程启动函数
+#ifdef _WIN32
+unsigned __stdcall thread_start(void *arg) {
+#else
+    void* thread_start(void *arg) {
+#endif
+    ConnectionArgs *conn_args = (ConnectionArgs*) arg;
+    P2PCONNECTION(conn_args->uuid, conn_args->pool, conn_args->target_ip, conn_args->target_port);
+    free(conn_args); // 释放内存
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+void create_connection_thread(char *uuid, CurlPool *pool, char *target_ip, unsigned short target_port) {
+    ConnectionArgs *args = malloc(sizeof(ConnectionArgs));
+    if (args == NULL) {
+        fprintf(stderr, "Failed to allocate memory for thread arguments.\n");
+        return;
+    }
+
+    args->uuid = uuid;
+    args->pool = pool;
+    args->target_ip = target_ip;
+    args->target_port = target_port;
+
+#ifdef _WIN32
+    uintptr_t thrd = _beginthreadex(NULL, 0, thread_start, args, 0, NULL);
+    if (thrd == 0) {
+        fprintf(stderr, "Failed to create thread.\n");
+        free(args); // 在创建线程失败时释放内存
+    } else {
+        CloseHandle((HANDLE)thrd); // 不需要等待这个线程
+    }
+#else
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, NULL, thread_start, args) != 0) {
+        fprintf(stderr, "Failed to create thread.\n");
+        free(args); // 在创建线程失败时释放内存
+    } else {
+        pthread_detach(thread_id); // 不需要等待这个线程
+    }
+#endif
+}
+
+char* base64Decode(const char* input) {
+    const char base64_chars[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+            "0123456789+/";
+    int T[256];
+    memset(T, -1, sizeof(T));
+    for (int i = 0; i < 64; i++) {
+        T[(int)base64_chars[i]] = i;
+    }
+
+    char* out = (char*)malloc(strlen(input) * 3 / 4 + 1);
+    if (!out) {
+        return NULL; // 更改这里为返回 NULL
+    }
+
+    int val = 0, valb = -8;
+    int outLen = 0;
+    for (; *input; input++) {
+        unsigned char c = *input;
+        if (T[c] == -1) break;
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0) {
+            out[outLen++] = (char)((val >> valb) & 0xFF);
+            valb -= 8;
+        }
+    }
+    out[outLen] = '\0';
+
+    return out;
+}
+
+typedef struct {
+    char ip[INET_ADDRSTRLEN]; // Enough space to store an IPv4 string
+    unsigned short port;      // Port number
+} ResolvedAddress;
+
+int resolve_domain_name(const char *domain_name, ResolvedAddress *target_addr) {
+    struct addrinfo hints, *res;
+    int status;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;        // Specify the address family (IPv4)
+    hints.ai_socktype = SOCK_STREAM;  // Specify the socket type
+
+    // Resolve the domain name to an IP address and service to a port number
+    if ((status = getaddrinfo(domain_name, NULL, &hints, &res)) != 0) {
+        fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
+        return -1;
+    }
+
+    // Use the first result
+    struct sockaddr_in *addr = (struct sockaddr_in *) res->ai_addr;
+    inet_ntop(AF_INET, &(addr->sin_addr), target_addr->ip, INET_ADDRSTRLEN);
+    target_addr->port = ntohs(addr->sin_port);  // Convert to host byte order
+
+    freeaddrinfo(res);  // Free the linked list
+    return 0;
+}
+
+// libcurl 的内存回调函数
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    char **response = (char **)userp;
+    *response = realloc(*response, realsize + 1);
+    if(*response == NULL) {
+        // out of memory!
+        printf("not enough memory (realloc returned NULL)\n");
+        return 0;
+    }
+    memcpy(*response, contents, realsize);
+    (*response)[realsize] = '\0';
+    return realsize;
+}
+
+void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
+    CURLcode res;
+    char *response = NULL;
+    char INFO_URL[MAX_URL_LENGTH];
+    snprintf(INFO_URL, sizeof(INFO_URL), "http://%s:%d/info", SERVER_ADDRESS, SERVER_PORT);
+    if(curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, INFO_URL);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        res = curl_easy_perform(curl);
+        if(res != CURLE_OK) {
+            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        } else {
+            // 处理 response
+            char *decoded = base64Decode(response);
+            char *token = strtok(decoded, "|");
+            while(token) {
+                int isDomain;
+                char *uuid, *target, *port_str;
+                unsigned short target_port;
+
+                isDomain = atoi(strtok(token, ";"));
+                uuid = strtok(NULL, ";");
+                target = strtok(NULL, ";");
+                port_str = strtok(NULL, ";");
+                target_port = (unsigned short) atoi(port_str);
+
+                if (isDomain == 0) { // IP
+                    create_connection_thread(uuid, pool, target, target_port);
+                } else { // Domain - treat as IP for example purposes
+                    ResolvedAddress addr;
+                    if(resolve_domain_name(target, &addr) == 0){
+                        create_connection_thread(uuid, pool, addr.ip, addr.port);
+                    }
+                }
+                token = strtok(NULL, "|");
+            }
+            free(decoded); // 假设 base64Decode 返回的是动态分配的内存
+        }
+        free(response);
+        //curl_easy_cleanup(curl);
+    }
+}
+
+
+int main() {
+#ifdef _WIN32
+    WSADATA wsa_data;
+    WSAStartup(MAKEWORD(2, 2), &wsa_data);
+#endif
+
+
+    CurlPool *pool = curl_pool_init();
+    CURL *infocurl = get_curl(pool);
+    while (TRUE){
+        fetch_and_connect(infocurl ,pool);
+        sleep(1);
+    }
     cleanup_curl();
 
 #ifdef _WIN32
     WSACleanup();
 #endif
-
     return 0;
 }
