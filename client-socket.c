@@ -42,7 +42,7 @@
 //#define SERVER_PORT 8888
 #define MAX_URL_LENGTH 130
 char *SERVER_ADDRESS = "127.0.0.1";
-int SERVER_PORT = 443;
+int SERVER_PORT = 8089;
 
 
 
@@ -266,6 +266,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     char SEND_URL[MAX_URL_LENGTH];
     snprintf(RECV_URL, sizeof(RECV_URL), "http://%s:%d/recv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
     snprintf(SEND_URL, sizeof(SEND_URL), "http://%s:%d/send?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+    printf("revc:  %s\nsend:   %s\n", RECV_URL, SEND_URL);
     struct MemoryStruct chunk;
     chunk.dynamic_memory = NULL;
     chunk.size = 0;
@@ -392,8 +393,11 @@ unsigned __stdcall thread_start(void *arg) {
     void* thread_start(void *arg) {
 #endif
     ConnectionArgs *conn_args = (ConnectionArgs*) arg;
+    printf("Starting thread ... uuid-%s target-%s port-%d\n",conn_args->uuid, conn_args->target_ip, conn_args->target_port);
     P2PCONNECTION(conn_args->uuid, conn_args->pool, conn_args->target_ip, conn_args->target_port);
-    free(conn_args); // 释放内存
+    free(conn_args->uuid);
+    free(conn_args->target_ip);
+    free(conn_args);
 #ifdef _WIN32
     return 0;
 #else
@@ -408,11 +412,10 @@ void create_connection_thread(char *uuid, CurlPool *pool, char *target_ip, unsig
         return;
     }
 
-    args->uuid = uuid;
     args->pool = pool;
-    args->target_ip = target_ip;
+    args->uuid = strdup(uuid);  // 深拷贝字符串
+    args->target_ip = strdup(target_ip);
     args->target_port = target_port;
-
 #ifdef _WIN32
     uintptr_t thrd = _beginthreadex(NULL, 0, thread_start, args, 0, NULL);
     if (thrd == 0) {
@@ -520,7 +523,7 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
         res = curl_easy_perform(curl);
         if(res != CURLE_OK) {
             fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-        } else {
+        } else if (response && strlen(response) > 0) {
             // 处理 response
             char *decoded = base64Decode(response);
             char *token = strtok(decoded, "|");
@@ -534,13 +537,15 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
                 target = strtok(NULL, ";");
                 port_str = strtok(NULL, ";");
                 target_port = (unsigned short) atoi(port_str);
-
+                printf("Get conncet info :uuid-%s target-%s port-%d\n",uuid, target, target_port);
                 if (isDomain == 0) { // IP
                     create_connection_thread(uuid, pool, target, target_port);
                 } else { // Domain - treat as IP for example purposes
                     ResolvedAddress addr;
                     if(resolve_domain_name(target, &addr) == 0){
-                        create_connection_thread(uuid, pool, addr.ip, addr.port);
+                        printf("Domain name: %s\n",target);
+                        printf("Resolved IP: %s, Port: %d\n",addr.ip, addr.port);
+                        create_connection_thread(uuid, pool, addr.ip, target_port);
                     }
                 }
                 token = strtok(NULL, "|");
