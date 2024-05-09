@@ -9,7 +9,9 @@ add_executable(https_tunnel_client
         client-socket.c
         base64.c
         base64.h
-#        client-alive.c
+        dns.c
+        dns.h
+        #        client-alive.c
 )
 find_package(CURL REQUIRED)
 target_link_libraries(https_tunnel_client PRIVATE CURL::libcurl ws2_32)

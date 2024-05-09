@@ -5,7 +5,7 @@
 #include <curl/curl.h>
 #include "base64.h"
 #include "rest_client_pool.h"
-
+#include "dns.h"
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -30,7 +30,7 @@
 
 #define BUFFER_SIZE 1024
 #define ENCODE_SIZE 2048
-
+void close_connection(const char *base_url, const char *uuid);
 
 //#define SERVER_IP "114.116.239.178"  // The IP address of the server to connect with socket
 //#define SERVER_PORT 22          // The port of the server to connect with socket
@@ -43,7 +43,7 @@
 #define MAX_URL_LENGTH 130
 char *SERVER_ADDRESS = "127.0.0.1";
 int SERVER_PORT = 8089;
-
+char CLOSE_URL[MAX_URL_LENGTH];
 
 
 void initialize_curl() {
@@ -168,14 +168,36 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
     return realsize;
 }
 
+typedef struct {
+    int connectionClosed; // 1 if "ConnectionStatus: close", 0 otherwise
+} HeaderData;
+
+static size_t constat_header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
+    size_t numbytes = size * nitems;
+    HeaderData *headerData = (HeaderData *)userdata;
+
+    // 查找并解析 "ConnectionStatus" 头
+    if (strncmp(buffer, "Connectionstatus: ", 18) == 0) {
+        // 提取这一行头部的值部分
+        const char *value = buffer + 18; // 跳过头部名称
+        if (strncmp(value, "close", 5) == 0) {
+            headerData->connectionClosed = 1;
+        }
+    }
+
+    return numbytes; // 必须返回这个值，告诉 curl 成功处理了多少字节
+}
 // 执行HTTP GET请求并获取响应
 int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
     if (curl) {
+        HeaderData headerData = {0}; // 初始化为0
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
-        //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
         //curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, constat_header_callback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headerData);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
@@ -185,7 +207,9 @@ int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
             fprintf(stderr, "GET request failed: %s\n", curl_easy_strerror(res));
             return -1;
         }
-
+        if(headerData.connectionClosed){
+            return -9;//原始连接已关闭
+        }
         return chunk->size;
     }
     return -1;
@@ -224,6 +248,44 @@ void http_post(CURL *curl, const char *url, const char *data, int len) {
 }
 
 
+void close_connection(const char *base_url, const char *uuid) {
+    CURL *curl;
+    CURLcode res;
+    char *full_url;
+    int url_length;
+
+    // 初始化 CURL
+    curl = curl_easy_init();
+    if (curl) {
+        // 计算完整 URL 的长度（包括 '?' 和 '=' 等字符）
+        url_length = snprintf(NULL, 0, "%s?client_id=%s", base_url, uuid) + 1;
+        // 分配内存以构建完整的 URL
+        full_url = malloc(url_length);
+        if (full_url == NULL) {
+            fprintf(stderr, "Failed to allocate memory for URL.\n");
+            return;
+        }
+        snprintf(full_url, url_length, "%s?client_id=%s", base_url, uuid);
+
+        // 设置 CURL 选项
+        curl_easy_setopt(curl, CURLOPT_URL, full_url);
+
+        // 执行 GET 请求
+        res = curl_easy_perform(curl);
+        printf("Send close sing to server...\n");
+        if (res != CURLE_OK) {
+            fprintf(stderr, "close_connection() - curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        }
+
+        // 清理
+        curl_easy_cleanup(curl);
+        free(full_url);
+    } else {
+        fprintf(stderr, "Failed to initialize CURL.\n");
+    }
+}
+
+
 void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short target_port){
     int sock;
     struct sockaddr_in server_addr;
@@ -237,6 +299,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     if (sock < 0) {
         perror("Socket creation failed");
         PRINTLASTERROR;
+        close_connection(CLOSE_URL, uuid);
         return;
     }
 
@@ -250,6 +313,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
         perror("Connection failed");
         PRINTLASTERROR;
         close(sock);
+        close_connection(CLOSE_URL, uuid);
         return;
     }
 
@@ -314,6 +378,9 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
 //            for (int i = 0; i < bytes_read; i++) {
 //                printf("%02X ", (unsigned char) encode_buffer[i]);
 //            }
+        } else if(bytes_read == -9){
+            printf("\nOriginal client has closed connection, kill current thread\n");
+            return; //远程连接已判断为关闭，结束线程
         }
 
         // Receive from remote
@@ -354,6 +421,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
             } else if (recv_total == 0) {
                 printf("Connection closed by the remote host.\n");
                 PRINTLASTERROR;
+                close_connection(CLOSE_URL, uuid);
                 return;
             } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -468,33 +536,29 @@ char* base64Decode(const char* input) {
     return out;
 }
 
-typedef struct {
-    char ip[INET_ADDRSTRLEN]; // Enough space to store an IPv4 string
-    unsigned short port;      // Port number
-} ResolvedAddress;
 
-int resolve_domain_name(const char *domain_name, ResolvedAddress *target_addr) {
-    struct addrinfo hints, *res;
-    int status;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;        // Specify the address family (IPv4)
-    hints.ai_socktype = SOCK_STREAM;  // Specify the socket type
-
-    // Resolve the domain name to an IP address and service to a port number
-    if ((status = getaddrinfo(domain_name, NULL, &hints, &res)) != 0) {
-        fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
-        return -1;
-    }
-
-    // Use the first result
-    struct sockaddr_in *addr = (struct sockaddr_in *) res->ai_addr;
-    inet_ntop(AF_INET, &(addr->sin_addr), target_addr->ip, INET_ADDRSTRLEN);
-    target_addr->port = ntohs(addr->sin_port);  // Convert to host byte order
-
-    freeaddrinfo(res);  // Free the linked list
-    return 0;
-}
+//int resolve_domain_name(const char *domain_name, ResolvedAddress *target_addr) {
+//    struct addrinfo hints, *res;
+//    int status;
+//
+//    memset(&hints, 0, sizeof(hints));
+//    hints.ai_family = AF_INET;        // Specify the address family (IPv4)
+//    hints.ai_socktype = SOCK_STREAM;  // Specify the socket type
+//
+//    // Resolve the domain name to an IP address and service to a port number
+//    if ((status = getaddrinfo(domain_name, NULL, &hints, &res)) != 0) {
+//        fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
+//        return -1;
+//    }
+//
+//    // Use the first result
+//    struct sockaddr_in *addr = (struct sockaddr_in *) res->ai_addr;
+//    inet_ntop(AF_INET, &(addr->sin_addr), target_addr->ip, INET_ADDRSTRLEN);
+//    target_addr->port = ntohs(addr->sin_port);  // Convert to host byte order
+//
+//    freeaddrinfo(res);  // Free the linked list
+//    return 0;
+//}
 
 // libcurl 的内存回调函数
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -541,11 +605,11 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
                 if (isDomain == 0) { // IP
                     create_connection_thread(uuid, pool, target, target_port);
                 } else { // Domain - treat as IP for example purposes
-                    ResolvedAddress addr;
-                    if(resolve_domain_name(target, &addr) == 0){
+                    char ipAddr[1024];
+                    if (gethostbydomain(target, ipAddr, 1024) == 0){
                         printf("Domain name: %s\n",target);
-                        printf("Resolved IP: %s, Port: %d\n",addr.ip, addr.port);
-                        create_connection_thread(uuid, pool, addr.ip, target_port);
+                        printf("Resolved IP: %s, Port: %d\n",ipAddr, target_port);
+                        create_connection_thread(uuid, pool, ipAddr, target_port);
                     }
                 }
                 token = strtok(NULL, "|");
@@ -564,7 +628,7 @@ int main() {
     WSAStartup(MAKEWORD(2, 2), &wsa_data);
 #endif
 
-
+    snprintf(CLOSE_URL, sizeof(CLOSE_URL), "http://%s:%d/close", SERVER_ADDRESS, SERVER_PORT);
     CurlPool *pool = curl_pool_init();
     CURL *infocurl = get_curl(pool);
     while (TRUE){
