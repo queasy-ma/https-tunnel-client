@@ -210,6 +210,7 @@ int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
         if(headerData.connectionClosed){
             return -9;//原始连接已关闭
         }
+        printf("url:%s\n",url);
         return chunk->size;
     }
     return -1;
