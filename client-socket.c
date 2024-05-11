@@ -6,6 +6,7 @@
 #include "base64.h"
 #include "rest_client_pool.h"
 #include "dns.h"
+#include "conn-hash-tabale.h"
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -62,8 +63,9 @@ typedef struct {
 typedef struct {
     char *uuid;
     CurlPool *pool; // 替换为正确的类型，如果它是一个结构体
-    char *target_ip;
+    char *target;
     unsigned short target_port;
+    bool isDomain;
 } ConnectionArgs;
 
 
@@ -194,7 +196,7 @@ int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
-        curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
         //curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, constat_header_callback);
         curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headerData);
@@ -210,7 +212,7 @@ int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
         if(headerData.connectionClosed){
             return -9;//原始连接已关闭
         }
-        printf("url:%s\n",url);
+        //printf("url:%s\n",url);
         return chunk->size;
     }
     return -1;
@@ -250,6 +252,7 @@ void http_post(CURL *curl, const char *url, const char *data, int len) {
 
 
 void close_connection(const char *base_url, const char *uuid) {
+    deleteConnection(uuid);
     CURL *curl;
     CURLcode res;
     char *full_url;
@@ -293,8 +296,6 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     unsigned char  buffer[BUFFER_SIZE] ;
 
 
-    initialize_curl();
-
     // Create socket
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -335,7 +336,13 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     struct MemoryStruct chunk;
     chunk.dynamic_memory = NULL;
     chunk.size = 0;
-
+    if(!changeConnection(uuid, sock)){
+        printf("[%s]Add socks error! kill current thread\n",uuid);
+        deleteConnection(uuid);
+        return_curl(pool, recvcurl);
+        return_curl(pool, sendcurl);
+        return;
+    }
     // Main loop: Get data via HTTP GET, send via socket, and POST response
     while (1) {
         FD_ZERO(&read_fds);
@@ -380,7 +387,10 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
 //                printf("%02X ", (unsigned char) encode_buffer[i]);
 //            }
         } else if(bytes_read == -9){
-            printf("\nOriginal client has closed connection, kill current thread\n");
+            printf("\n[%s]Original client has closed connection, kill current thread\n",uuid);
+            deleteConnection(uuid);
+            return_curl(pool, recvcurl);
+            return_curl(pool, sendcurl);
             return; //远程连接已判断为关闭，结束线程
         }
 
@@ -413,6 +423,10 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                     if (new_buffer == NULL) {
                         perror("Failed to allocate buffer");
                         free(data_buffer);
+                        close_connection(CLOSE_URL, uuid);
+                        deleteConnection(uuid);
+                        return_curl(pool, recvcurl);
+                        return_curl(pool, sendcurl);
                         return;
                     }
                     data_buffer = new_buffer;
@@ -420,9 +434,12 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                 memcpy(data_buffer + data_size, buffer, recv_total);
                 data_size += recv_total;
             } else if (recv_total == 0) {
-                printf("Connection closed by the remote host.\n");
+                printf("[%s]Connection closed by the remote host.\n",uuid);
                 PRINTLASTERROR;
                 close_connection(CLOSE_URL, uuid);
+                deleteConnection(uuid);
+                return_curl(pool, recvcurl);
+                return_curl(pool, sendcurl);
                 return;
             } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -431,6 +448,10 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                 } else {
                     perror("recv failed");
                     free(data_buffer);
+                    close_connection(CLOSE_URL, uuid);
+                    deleteConnection(uuid);
+                    return_curl(pool, recvcurl);
+                    return_curl(pool, sendcurl);
                     return;
                 }
             }
@@ -449,6 +470,8 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     }
 
     close(sock);
+    close_connection(CLOSE_URL, uuid);
+    deleteConnection(uuid);
     return_curl(pool, recvcurl);
     return_curl(pool, sendcurl);
 
@@ -462,11 +485,25 @@ unsigned __stdcall thread_start(void *arg) {
     void* thread_start(void *arg) {
 #endif
     ConnectionArgs *conn_args = (ConnectionArgs*) arg;
-    printf("Starting thread ... uuid-%s target-%s port-%d\n",conn_args->uuid, conn_args->target_ip, conn_args->target_port);
-    P2PCONNECTION(conn_args->uuid, conn_args->pool, conn_args->target_ip, conn_args->target_port);
-    free(conn_args->uuid);
-    free(conn_args->target_ip);
-    free(conn_args);
+        if(conn_args->isDomain) {
+            char ipAddr[1024];
+            printf("Domain name: %s\n",conn_args->target);
+            if (gethostbydomain(conn_args->target, ipAddr, 1024) == 0){
+                printf("Starting thread ... uuid-%s target-%s port-%d\n",conn_args->uuid, ipAddr, conn_args->target_port);
+                P2PCONNECTION(conn_args->uuid, conn_args->pool, ipAddr, conn_args->target_port);
+                free(conn_args->uuid);
+                free(conn_args->target);
+                free(conn_args);
+            } else{
+                close_connection(CLOSE_URL, conn_args->uuid);
+            }
+        } else{
+            printf("Starting thread ... uuid-%s target-%s port-%d\n",conn_args->uuid, conn_args->target, conn_args->target_port);
+            P2PCONNECTION(conn_args->uuid, conn_args->pool, conn_args->target, conn_args->target_port);
+            free(conn_args->uuid);
+            free(conn_args->target);
+            free(conn_args);
+        }
 #ifdef _WIN32
     return 0;
 #else
@@ -474,21 +511,23 @@ unsigned __stdcall thread_start(void *arg) {
 #endif
 }
 
-void create_connection_thread(char *uuid, CurlPool *pool, char *target_ip, unsigned short target_port) {
+void create_connection_thread(char *uuid, CurlPool *pool, char *target, unsigned short target_port, bool isDomain) {
     ConnectionArgs *args = malloc(sizeof(ConnectionArgs));
     if (args == NULL) {
-        fprintf(stderr, "Failed to allocate memory for thread arguments.\n");
+        fprintf(stderr, "[%s]Failed to allocate memory for thread arguments.\n", uuid);
         return;
     }
 
     args->pool = pool;
     args->uuid = strdup(uuid);  // 深拷贝字符串
-    args->target_ip = strdup(target_ip);
+    args->target = strdup(target);
     args->target_port = target_port;
+    args->isDomain = isDomain;
 #ifdef _WIN32
     uintptr_t thrd = _beginthreadex(NULL, 0, thread_start, args, 0, NULL);
     if (thrd == 0) {
         fprintf(stderr, "Failed to create thread.\n");
+        deleteConnection(uuid);
         free(args); // 在创建线程失败时释放内存
     } else {
         CloseHandle((HANDLE)thrd); // 不需要等待这个线程
@@ -497,6 +536,7 @@ void create_connection_thread(char *uuid, CurlPool *pool, char *target_ip, unsig
     pthread_t thread_id;
     if (pthread_create(&thread_id, NULL, thread_start, args) != 0) {
         fprintf(stderr, "Failed to create thread.\n");
+        deleteConnection(uuid);
         free(args); // 在创建线程失败时释放内存
     } else {
         pthread_detach(thread_id); // 不需要等待这个线程
@@ -585,6 +625,7 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
         curl_easy_setopt(curl, CURLOPT_URL, INFO_URL);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
         res = curl_easy_perform(curl);
         if(res != CURLE_OK) {
             fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
@@ -599,19 +640,20 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
 
                 isDomain = atoi(strtok(token, ";"));
                 uuid = strtok(NULL, ";");
+                if(findConnection(uuid)){
+                    return;
+                } else if(!addConnection(uuid, 0)){
+                    printf("[%s]Add connection info error\n",uuid);
+                    return;
+                }
                 target = strtok(NULL, ";");
                 port_str = strtok(NULL, ";");
                 target_port = (unsigned short) atoi(port_str);
                 printf("Get conncet info :uuid-%s target-%s port-%d\n",uuid, target, target_port);
                 if (isDomain == 0) { // IP
-                    create_connection_thread(uuid, pool, target, target_port);
-                } else { // Domain - treat as IP for example purposes
-                    char ipAddr[1024];
-                    if (gethostbydomain(target, ipAddr, 1024) == 0){
-                        printf("Domain name: %s\n",target);
-                        printf("Resolved IP: %s, Port: %d\n",ipAddr, target_port);
-                        create_connection_thread(uuid, pool, ipAddr, target_port);
-                    }
+                    create_connection_thread(uuid, pool, target, target_port, false);
+                } else { // Domain
+                        create_connection_thread(uuid, pool, target, target_port, true);
                 }
                 token = strtok(NULL, "|");
             }
@@ -628,7 +670,8 @@ int main() {
     WSADATA wsa_data;
     WSAStartup(MAKEWORD(2, 2), &wsa_data);
 #endif
-
+    initialize_curl();
+    initializeTable();
     snprintf(CLOSE_URL, sizeof(CLOSE_URL), "http://%s:%d/close", SERVER_ADDRESS, SERVER_PORT);
     CurlPool *pool = curl_pool_init();
     CURL *infocurl = get_curl(pool);

@@ -8,7 +8,7 @@
 #include <pthread.h>
 #include <stdio.h>
 
-#define MAX_CURL_HANDLES 50
+#define MAX_CURL_HANDLES 100
 
 typedef struct {
     CURL *handles[MAX_CURL_HANDLES];

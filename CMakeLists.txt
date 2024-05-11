@@ -11,6 +11,8 @@ add_executable(https_tunnel_client
         base64.h
         dns.c
         dns.h
+        conn-hash-tabale.c
+        conn-hash-tabale.h
         #        client-alive.c
 )
 find_package(CURL REQUIRED)
