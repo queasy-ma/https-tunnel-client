@@ -330,9 +330,9 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     CURL *sendcurl = get_curl(pool);
     char RECV_URL[MAX_URL_LENGTH];
     char SEND_URL[MAX_URL_LENGTH];
-    snprintf(RECV_URL, sizeof(RECV_URL), "http://%s:%d/recv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
-    snprintf(SEND_URL, sizeof(SEND_URL), "http://%s:%d/send?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
-    printf("revc:  %s\nsend:   %s\n", RECV_URL, SEND_URL);
+    snprintf(RECV_URL, sizeof(RECV_URL), "https://%s:%d/recv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+    snprintf(SEND_URL, sizeof(SEND_URL), "https://%s:%d/send?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+    //printf("revc:  %s\nsend:   %s\n", RECV_URL, SEND_URL);
     struct MemoryStruct chunk;
     chunk.dynamic_memory = NULL;
     chunk.size = 0;
@@ -380,7 +380,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                 chunk.dynamic_memory = NULL;
             }
 
-            printf("\nrecv from client %d bytes, send to remote", bytes_read);
+            printf("\n[%s]recv from client %d bytes, send to remote", uuid,bytes_read);
 
 //            printf("\n\nrecv from client %d bytes, send to remote\nraw:\n", bytes_read);
 //            for (int i = 0; i < bytes_read; i++) {
@@ -459,7 +459,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
 
         if (data_size > 0 && data_buffer != NULL) {
             http_post(sendcurl, SEND_URL, data_buffer, data_size);
-            printf("\nrecv from remote %d bytes, send to client", data_size);
+            printf("\n[%s]recv from remote %d bytes, send to client", uuid,data_size);
 
 //                printf("\n\nrecv from remote %d bytes, send to client\nraw:\n", data_size);
 //                for (int i = 0; i < data_size; i++) {
@@ -620,34 +620,66 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
     CURLcode res;
     char *response = NULL;
     char INFO_URL[MAX_URL_LENGTH];
-    snprintf(INFO_URL, sizeof(INFO_URL), "http://%s:%d/info", SERVER_ADDRESS, SERVER_PORT);
+    snprintf(INFO_URL, sizeof(INFO_URL), "https://%s:%d/info", SERVER_ADDRESS, SERVER_PORT);
     if(curl) {
         curl_easy_setopt(curl, CURLOPT_URL, INFO_URL);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
         res = curl_easy_perform(curl);
         if(res != CURLE_OK) {
             fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
         } else if (response && strlen(response) > 0) {
             // 处理 response
-            char *decoded = base64Decode(response);
-            char *token = strtok(decoded, "|");
+            //char *decoded = base64Decode(response);
+            char *token = strtok(response, "|");
             while(token) {
+                char *decoded = base64Decode(token);
+                if (!decoded) {
+                    fprintf(stderr, "Failed to decode base64 string.\n");
+                    return; // 解码失败处理
+                }
+                printf("\nDecode connection info:%s\n",decoded);
                 int isDomain;
                 char *uuid, *target, *port_str;
                 unsigned short target_port;
 
-                isDomain = atoi(strtok(token, ";"));
-                uuid = strtok(NULL, ";");
+                char *subtoken = strtok(decoded, ";");
+                if (subtoken == NULL) {
+                    fprintf(stderr, "Decoded string format error.\n");
+                    free(decoded);
+                    return; // 格式错误处理
+                }
+                isDomain = atoi(subtoken);
+                subtoken = strtok(NULL, ";");
+                if (subtoken == NULL) {
+                    fprintf(stderr, "Decoded string format error: Missing UUID.\n");
+                    free(decoded);
+                    return; // 格式错误处理
+                }
+                uuid = subtoken;
                 if(findConnection(uuid)){
+                    free(decoded);
                     return;
                 } else if(!addConnection(uuid, 0)){
                     printf("[%s]Add connection info error\n",uuid);
+                    free(decoded);
                     return;
                 }
-                target = strtok(NULL, ";");
-                port_str = strtok(NULL, ";");
+                subtoken = strtok(NULL, ";");
+                if (subtoken == NULL) {
+                    fprintf(stderr, "Decoded string format error: Missing target.\n");
+                    free(decoded);
+                    return; // 格式错误处理
+                }
+                target = subtoken;
+                subtoken = strtok(NULL, ";");
+                if (subtoken == NULL) {
+                    fprintf(stderr, "Decoded string format error: Missing port.\n");
+                    free(decoded);
+                    return; // 格式错误处理
+                }
+                port_str = subtoken;
                 target_port = (unsigned short) atoi(port_str);
                 printf("Get conncet info :uuid-%s target-%s port-%d\n",uuid, target, target_port);
                 if (isDomain == 0) { // IP
@@ -656,8 +688,8 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
                         create_connection_thread(uuid, pool, target, target_port, true);
                 }
                 token = strtok(NULL, "|");
+                free(decoded); // 假设 base64Decode 返回的是动态分配的内存
             }
-            free(decoded); // 假设 base64Decode 返回的是动态分配的内存
         }
         free(response);
         //curl_easy_cleanup(curl);
@@ -665,14 +697,74 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
 }
 
 
-int main() {
+
+void display_help() {
+    printf("Usage: program [options]\n");
+    printf("Options:\n");
+    printf("  -s, --server-address <address>  Set the server IP address (default: 127.0.0.1)\n");
+    printf("  -p, --server-port <port>        Set the server port (default: 8089)\n");
+    printf("  --help                           Display this help message and exit\n");
+}
+
+#ifdef _WIN32
+void parse_arguments(int argc, char *argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            display_help();
+            exit(0);
+        } else if ((strcmp(argv[i], "--server-address") == 0 || strcmp(argv[i], "-s") == 0) && i + 1 < argc) {
+            SERVER_ADDRESS = argv[++i];
+        } else if ((strcmp(argv[i], "--server-port") == 0 || strcmp(argv[i], "-p") == 0) && i + 1 < argc) {
+            SERVER_PORT = atoi(argv[++i]);
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            exit(1);
+        }
+    }
+}
+#else
+void parse_arguments(int argc, char *argv[]) {
+    int opt;
+    const char* short_opts = "s:p:";
+    struct option long_options[] = {
+        {"server-address", required_argument, NULL, 's'},
+        {"server-port", required_argument, NULL, 'p'},
+        {"help", no_argument, NULL, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    while ((opt = getopt_long(argc, argv, short_opts, long_options, NULL)) != -1) {
+        switch (opt) {
+            case 's':
+                SERVER_ADDRESS = optarg;
+                break;
+            case 'p':
+                SERVER_PORT = atoi(optarg);
+                break;
+            case 'h':
+                display_help();
+                exit(0);
+                break;
+            default:
+                display_help();
+                exit(1);
+                break;
+        }
+    }
+}
+#endif
+
+int main(int argc, char *argv[]) {
+    parse_arguments(argc, argv);
+    printf("Server Address: %s\n", SERVER_ADDRESS);
+    printf("Server Port: %d\n", SERVER_PORT);
 #ifdef _WIN32
     WSADATA wsa_data;
     WSAStartup(MAKEWORD(2, 2), &wsa_data);
 #endif
     initialize_curl();
     initializeTable();
-    snprintf(CLOSE_URL, sizeof(CLOSE_URL), "http://%s:%d/close", SERVER_ADDRESS, SERVER_PORT);
+    snprintf(CLOSE_URL, sizeof(CLOSE_URL), "https://%s:%d/close", SERVER_ADDRESS, SERVER_PORT);
     CurlPool *pool = curl_pool_init();
     CURL *infocurl = get_curl(pool);
     while (TRUE){
