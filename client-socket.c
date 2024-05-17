@@ -7,13 +7,13 @@
 #include "rest_client_pool.h"
 #include "dns.h"
 #include "conn-hash-tabale.h"
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <io.h>
 #include <process.h>
 #include <windows.h>
-
 #pragma comment(lib, "ws2_32.lib")
 #define close closesocket
 #define sleep(x) Sleep(1000 * (x))
@@ -26,10 +26,21 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #endif
-#define PRINTLASTERROR printf("WSAGetLastError: %d\n", WSAGetLastError())
+
+void PRINTLASTERROR() {
+#ifdef _WIN32
+    fprintf(stderr, "Error: %d\n", WSAGetLastError());
+#else
+    perror("Error");
+#endif
+}
+
+#define PRINTLASTERROR PRINTLASTERROR()
 
 #define BUFFER_SIZE 1024
+#define MAX_RETRIES 5
 #define ENCODE_SIZE 2048
 void close_connection(const char *base_url, const char *uuid);
 
@@ -45,6 +56,7 @@ void close_connection(const char *base_url, const char *uuid);
 char *SERVER_ADDRESS = "127.0.0.1";
 int SERVER_PORT = 8089;
 char CLOSE_URL[MAX_URL_LENGTH];
+
 
 
 void initialize_curl() {
@@ -203,6 +215,8 @@ int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
@@ -234,6 +248,8 @@ void http_post(CURL *curl, const char *url, const char *data, int len) {
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
             curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         // 设置HTTP头部，指明内容类型为二进制流
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
@@ -273,6 +289,8 @@ void close_connection(const char *base_url, const char *uuid) {
 
         // 设置 CURL 选项
         curl_easy_setopt(curl, CURLOPT_URL, full_url);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 
         // 执行 GET 请求
         res = curl_easy_perform(curl);
@@ -290,6 +308,112 @@ void close_connection(const char *base_url, const char *uuid) {
 }
 
 
+void check_connection(int sockfd) {
+    int error = 0;
+    socklen_t len = sizeof(error);
+    int retval = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (void *)&error, &len);
+
+    if (retval != 0) {
+#ifdef _WIN32
+        fprintf(stderr, "getsockopt failed: %d\n", WSAGetLastError());
+#else
+        fprintf(stderr, "getsockopt failed: %s\n", strerror(retval));
+#endif
+        return;
+    }
+
+    if (error != 0) {
+#ifdef _WIN32
+        fprintf(stderr, "socket error: %d\n", error);
+#else
+        fprintf(stderr, "socket error: %s\n", strerror(error));
+#endif
+    } else {
+        printf("No socket error, but connection may be closed by peer\n");
+    }
+}
+
+
+int create_socket() {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        PRINTLASTERROR;
+    }
+    return sock;
+}
+
+int connect_with_retries(int sock, struct sockaddr_in *server_addr, int retries) {
+    for (int i = 0; i < retries; ++i) {
+        if (connect(sock, (struct sockaddr *)server_addr, sizeof(*server_addr)) == 0) {
+            return 0;
+        }
+        PRINTLASTERROR;
+        sleep(1); // 等待1秒后重试
+    }
+    return -1;
+}
+
+void configure_keepalive(int sock) {
+    int optval = 1;
+    socklen_t optlen = sizeof(optval);
+
+    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&optval, optlen) < 0) {
+        PRINTLASTERROR;
+    }
+
+#ifdef _WIN32
+    DWORD bytesReturned = 0;
+    struct tcp_keepalive keepaliveSettings;
+    keepaliveSettings.onoff = 1;
+    keepaliveSettings.keepalivetime = 60000;  // 60秒无数据开始探测
+    keepaliveSettings.keepaliveinterval = 10000; // 每10秒探测一次
+
+    if (WSAIoctl(sock, SIO_KEEPALIVE_VALS, &keepaliveSettings, sizeof(keepaliveSettings), NULL, 0, &bytesReturned, NULL, NULL) != 0) {
+        PRINTLASTERROR;
+    }
+#else
+    int keepidle = 60;  // 60秒无数据开始探测
+    int keepintvl = 10; // 每10秒探测一次
+    int keepcnt = 5;    // 探测5次无响应后认为连接失效
+
+    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, optlen) < 0) {
+        PRINTLASTERROR();
+    }
+
+    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, optlen) < 0) {
+        PRINTLASTERROR();
+    }
+
+    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, optlen) < 0) {
+        PRINTLASTERROR();
+    }
+#endif
+}
+
+void set_socket_timeout(int sock, int timeout_sec) {
+    struct timeval timeout;
+    timeout.tv_sec = timeout_sec;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
+        PRINTLASTERROR;
+    }
+
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
+        PRINTLASTERROR;
+    }
+}
+
+void close_socket(int sock, const char* url, const char* uuid) {
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+    close_connection(url, uuid);
+}
+
+
 void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short target_port){
     int sock;
     struct sockaddr_in server_addr;
@@ -297,12 +421,9 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
 
 
     // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, 0);
+    sock = create_socket();
     if (sock < 0) {
-        perror("Socket creation failed");
-        PRINTLASTERROR;
         close_connection(CLOSE_URL, uuid);
-        return;
     }
 
     // Configure the server address
@@ -310,28 +431,29 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     server_addr.sin_port = htons(target_port);
     server_addr.sin_addr.s_addr = inet_addr(tartget_ip);
 
-    // Connect to the server
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection failed");
-        PRINTLASTERROR;
-        close(sock);
-        close_connection(CLOSE_URL, uuid);
-        return;
+    // Connect to the target with retries
+    if (connect_with_retries(sock, &server_addr, MAX_RETRIES) < 0) {
+        close_socket(sock, CLOSE_URL, uuid);
     }
-
+   // Configure keepalive
+    configure_keepalive(sock);
     printf("Get connection success,%d\n", sock);
+    // Set socket timeouts
+    set_socket_timeout(sock, 30); // 30秒超时
+
     fd_set read_fds;
     int max_fd = sock;
     if (pool == NULL) {
         fprintf(stderr, "Failed to create curl pool\n");
+        close_socket(sock, CLOSE_URL, uuid);
         return;
     }
     CURL *recvcurl = get_curl(pool);
     CURL *sendcurl = get_curl(pool);
     char RECV_URL[MAX_URL_LENGTH];
     char SEND_URL[MAX_URL_LENGTH];
-    snprintf(RECV_URL, sizeof(RECV_URL), "https://%s:%d/recv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
-    snprintf(SEND_URL, sizeof(SEND_URL), "https://%s:%d/send?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+    snprintf(RECV_URL, sizeof(RECV_URL), "https://%s:%d/maprecv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+    snprintf(SEND_URL, sizeof(SEND_URL), "https://%s:%d/mapsend?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
     //printf("revc:  %s\nsend:   %s\n", RECV_URL, SEND_URL);
     struct MemoryStruct chunk;
     chunk.dynamic_memory = NULL;
@@ -339,6 +461,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     if(!changeConnection(uuid, sock)){
         printf("[%s]Add socks error! kill current thread\n",uuid);
         deleteConnection(uuid);
+        close_socket(sock, CLOSE_URL, uuid);
         return_curl(pool, recvcurl);
         return_curl(pool, sendcurl);
         return;
@@ -363,10 +486,12 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                     PRINTLASTERROR;
                     break;
                 }
-//                printf("\n\nrecv from client %d bytes, send to remote\nraw:\n", bytes_read);
+
+//                printf("\n\n[%s]recv from client %d bytes, send to remote\nraw:\n",uuid,  bytes_read);
 //                for (int i = 0; i < bytes_read; i++) {
 //                    printf("%02X ", (unsigned char) chunk.dynamic_memory[i]);
 //                }
+
                 free(chunk.dynamic_memory);
                 chunk.size = 0;
                 chunk.dynamic_memory = NULL;
@@ -376,6 +501,10 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                     PRINTLASTERROR;
                     break;
                 }
+//                printf("\n\n[%s]recv from client %d bytes, send to remote\nraw:\n",uuid,  bytes_read);
+//                for (int i = 0; i < bytes_read; i++) {
+//                    printf("%02X ", (unsigned char) chunk.static_memory[i]);
+//                }
                 chunk.size = 0;
                 chunk.dynamic_memory = NULL;
             }
@@ -389,6 +518,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
         } else if(bytes_read == -9){
             printf("\n[%s]Original client has closed connection, kill current thread\n",uuid);
             deleteConnection(uuid);
+            close_socket(sock, CLOSE_URL, uuid);
             return_curl(pool, recvcurl);
             return_curl(pool, sendcurl);
             return; //远程连接已判断为关闭，结束线程
@@ -423,7 +553,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                     if (new_buffer == NULL) {
                         perror("Failed to allocate buffer");
                         free(data_buffer);
-                        close_connection(CLOSE_URL, uuid);
+                        close_socket(sock, CLOSE_URL, uuid);
                         deleteConnection(uuid);
                         return_curl(pool, recvcurl);
                         return_curl(pool, sendcurl);
@@ -434,9 +564,10 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                 memcpy(data_buffer + data_size, buffer, recv_total);
                 data_size += recv_total;
             } else if (recv_total == 0) {
-                printf("[%s]Connection closed by the remote host.\n",uuid);
+                printf("\n[%s]Connection closed by the remote host.\n",uuid);
                 PRINTLASTERROR;
-                close_connection(CLOSE_URL, uuid);
+                check_connection(sock);
+                close_socket(sock, CLOSE_URL, uuid);
                 deleteConnection(uuid);
                 return_curl(pool, recvcurl);
                 return_curl(pool, sendcurl);
@@ -448,7 +579,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
                 } else {
                     perror("recv failed");
                     free(data_buffer);
-                    close_connection(CLOSE_URL, uuid);
+                    close_socket(sock, CLOSE_URL, uuid);
                     deleteConnection(uuid);
                     return_curl(pool, recvcurl);
                     return_curl(pool, sendcurl);
@@ -461,16 +592,16 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
             http_post(sendcurl, SEND_URL, data_buffer, data_size);
             printf("\n[%s]recv from remote %d bytes, send to client", uuid,data_size);
 
-//                printf("\n\nrecv from remote %d bytes, send to client\nraw:\n", data_size);
+//                printf("\n\n[%s]recv from remote %d bytes, send to client\nraw:\n",uuid, data_size);
 //                for (int i = 0; i < data_size; i++) {
 //                    printf("%02X ", (unsigned char)data_buffer[i]);
 //                }
+
             free(data_buffer);
         }
     }
 
-    close(sock);
-    close_connection(CLOSE_URL, uuid);
+    close_socket(sock, CLOSE_URL, uuid);
     deleteConnection(uuid);
     return_curl(pool, recvcurl);
     return_curl(pool, sendcurl);
@@ -625,6 +756,8 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
         curl_easy_setopt(curl, CURLOPT_URL, INFO_URL);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
         res = curl_easy_perform(curl);
         if(res != CURLE_OK) {
@@ -696,6 +829,77 @@ void fetch_and_connect(CurlPool *curl,  CurlPool *pool) {
     }
 }
 
+void fetch_map_and_connect(CurlPool *curl,  CurlPool *pool) {
+    CURLcode res;
+    char *response = NULL;
+    char INFO_URL[MAX_URL_LENGTH];
+    snprintf(INFO_URL, sizeof(INFO_URL), "https://%s:%d/mapinfo", SERVER_ADDRESS, SERVER_PORT);
+    if(curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, INFO_URL);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        res = curl_easy_perform(curl);
+        if(res != CURLE_OK) {
+            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        } else if (response && strlen(response) > 0) {
+            // 处理 response
+            //char *decoded = base64Decode(response);
+            char *token = strtok(response, "|");
+            while(token) {
+                char *decoded = base64Decode(token);
+                if (!decoded) {
+                    fprintf(stderr, "Failed to decode base64 string.\n");
+                    return; // 解码失败处理
+                }
+                printf("\nDecode connection info:%s\n",decoded);
+                char *uuid, *target, *port_str;
+                unsigned short target_port;
+
+
+                char *subtoken = strtok(decoded, ";");
+                if (subtoken == NULL) {
+                    fprintf(stderr, "Decoded string format error: Missing UUID.\n");
+                    free(decoded);
+                    return; // 格式错误处理
+                }
+                uuid = subtoken;
+                if(findConnection(uuid)){
+                    free(decoded);
+                    return;
+                } else if(!addConnection(uuid, 0)){
+                    printf("[%s]Add connection info error\n",uuid);
+                    free(decoded);
+                    return;
+                }
+                subtoken = strtok(NULL, ";");
+                if (subtoken == NULL) {
+                    fprintf(stderr, "Decoded string format error: Missing target.\n");
+                    free(decoded);
+                    return; // 格式错误处理
+                }
+                target = subtoken;
+                subtoken = strtok(NULL, ";");
+                if (subtoken == NULL) {
+                    fprintf(stderr, "Decoded string format error: Missing port.\n");
+                    free(decoded);
+                    return; // 格式错误处理
+                }
+                port_str = subtoken;
+                target_port = (unsigned short) atoi(port_str);
+                printf("Get conncet info :uuid-%s target-%s port-%d\n",uuid, target, target_port);
+                create_connection_thread(uuid, pool, target, target_port, false);
+                token = strtok(NULL, "|");
+                free(decoded); // 假设 base64Decode 返回的是动态分配的内存
+            }
+        }
+        free(response);
+        //curl_easy_cleanup(curl);
+    }
+}
+
 
 
 void display_help() {
@@ -754,6 +958,8 @@ void parse_arguments(int argc, char *argv[]) {
 }
 #endif
 
+
+
 int main(int argc, char *argv[]) {
     parse_arguments(argc, argv);
     printf("Server Address: %s\n", SERVER_ADDRESS);
@@ -764,11 +970,12 @@ int main(int argc, char *argv[]) {
 #endif
     initialize_curl();
     initializeTable();
-    snprintf(CLOSE_URL, sizeof(CLOSE_URL), "https://%s:%d/close", SERVER_ADDRESS, SERVER_PORT);
+    snprintf(CLOSE_URL, sizeof(CLOSE_URL), "https://%s:%d/mapclose", SERVER_ADDRESS, SERVER_PORT);
     CurlPool *pool = curl_pool_init();
     CURL *infocurl = get_curl(pool);
     while (TRUE){
-        fetch_and_connect(infocurl ,pool);
+        //fetch_and_connect(infocurl ,pool);
+        fetch_map_and_connect(infocurl, pool);
         sleep(1);
     }
     cleanup_curl();
@@ -777,4 +984,6 @@ int main(int argc, char *argv[]) {
     WSACleanup();
 #endif
     return 0;
+
+
 }
