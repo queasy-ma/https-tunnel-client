@@ -2,8 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <curl/curl.h>
-#include "base64.h"
 #include "rest_client_pool.h"
 #include "dns.h"
 #include "conn-hash-tabale.h"
@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <getopt.h>
 #endif
 
 void PRINTLASTERROR() {
@@ -81,6 +82,13 @@ typedef struct {
 } ConnectionArgs;
 
 
+void kill_current_thread() {
+#ifdef _WIN32
+    ExitThread(0);
+#else
+    pthread_exit(NULL);
+#endif
+}
 //base64解码版本
 //size_t write_data(void *ptr, size_t size, size_t nmemb, void *userp) {
 //    size_t real_size = size * nmemb;
@@ -203,28 +211,29 @@ static size_t constat_header_callback(char *buffer, size_t size, size_t nitems, 
 }
 // 执行HTTP GET请求并获取响应
 int http_get(CURL *curl, const char *url, struct MemoryStruct *chunk) {
+    long http_code = 0;
     if (curl) {
         HeaderData headerData = {0}; // 初始化为0
         curl_easy_setopt(curl, CURLOPT_URL, url);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)chunk);
-        //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
+        //curl_easy_setopt(curl, CURLOPT_PROXY, "http://10.5.1.115:8080");
         //curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, constat_header_callback);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headerData);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+//        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, constat_header_callback);
+//        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headerData);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+//        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             fprintf(stderr, "GET request failed: %s\n", curl_easy_strerror(res));
             return -1;
         }
-        if(headerData.connectionClosed){
-            return -9;//原始连接已关闭
+        if(http_code == 404){
+            return -9;
         }
         //printf("url:%s\n",url);
         return chunk->size;
@@ -244,9 +253,9 @@ void http_post(CURL *curl, const char *url, const char *data, int len) {
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
            //curl_easy_setopt(curl, CURLOPT_PROXY, "http://127.0.0.1:8080");
             //curl_easy_setopt(curl, CURLOPT_PROXY, "socks5://65.20.69.106:1081");
-            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
-            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+//            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+//            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+//            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
             curl_easy_setopt(curl, CURLOPT_POST, 1L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -353,42 +362,42 @@ int connect_with_retries(int sock, struct sockaddr_in *server_addr, int retries)
     return -1;
 }
 
-void configure_keepalive(int sock) {
-    int optval = 1;
-    socklen_t optlen = sizeof(optval);
-
-    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&optval, optlen) < 0) {
-        PRINTLASTERROR;
-    }
-
-#ifdef _WIN32
-    DWORD bytesReturned = 0;
-    struct tcp_keepalive keepaliveSettings;
-    keepaliveSettings.onoff = 1;
-    keepaliveSettings.keepalivetime = 60000;  // 60秒无数据开始探测
-    keepaliveSettings.keepaliveinterval = 10000; // 每10秒探测一次
-
-    if (WSAIoctl(sock, SIO_KEEPALIVE_VALS, &keepaliveSettings, sizeof(keepaliveSettings), NULL, 0, &bytesReturned, NULL, NULL) != 0) {
-        PRINTLASTERROR;
-    }
-#else
-    int keepidle = 60;  // 60秒无数据开始探测
-    int keepintvl = 10; // 每10秒探测一次
-    int keepcnt = 5;    // 探测5次无响应后认为连接失效
-
-    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, optlen) < 0) {
-        PRINTLASTERROR();
-    }
-
-    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, optlen) < 0) {
-        PRINTLASTERROR();
-    }
-
-    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, optlen) < 0) {
-        PRINTLASTERROR();
-    }
-#endif
-}
+//void configure_keepalive(int sock) {
+//    int optval = 1;
+//    socklen_t optlen = sizeof(optval);
+//
+//    if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&optval, optlen) < 0) {
+//        PRINTLASTERROR;
+//    }
+//
+//#ifdef _WIN32
+//    DWORD bytesReturned = 0;
+//    struct tcp_keepalive keepaliveSettings;
+//    keepaliveSettings.onoff = 1;
+//    keepaliveSettings.keepalivetime = 60000;  // 60秒无数据开始探测
+//    keepaliveSettings.keepaliveinterval = 10000; // 每10秒探测一次
+//
+//    if (WSAIoctl(sock, SIO_KEEPALIVE_VALS, &keepaliveSettings, sizeof(keepaliveSettings), NULL, 0, &bytesReturned, NULL, NULL) != 0) {
+//        PRINTLASTERROR;
+//    }
+//#else
+//    int keepidle = 60;  // 60秒无数据开始探测
+//    int keepintvl = 10; // 每10秒探测一次
+//    int keepcnt = 5;    // 探测5次无响应后认为连接失效
+//
+//    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, optlen) < 0) {
+//        PRINTLASTERROR();
+//    }
+//
+//    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, optlen) < 0) {
+//        PRINTLASTERROR();
+//    }
+//
+//    if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, optlen) < 0) {
+//        PRINTLASTERROR();
+//    }
+//#endif
+//}
 
 void set_socket_timeout(int sock, int timeout_sec) {
     struct timeval timeout;
@@ -436,7 +445,7 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
         close_socket(sock, CLOSE_URL, uuid);
     }
    // Configure keepalive
-    configure_keepalive(sock);
+    //configure_keepalive(sock);
     printf("Get connection success,%d\n", sock);
     // Set socket timeouts
     set_socket_timeout(sock, 30); // 30秒超时
@@ -452,8 +461,11 @@ void P2PCONNECTION(char *uuid, CurlPool *pool, char *tartget_ip, unsigned short 
     CURL *sendcurl = get_curl(pool);
     char RECV_URL[MAX_URL_LENGTH];
     char SEND_URL[MAX_URL_LENGTH];
-    snprintf(RECV_URL, sizeof(RECV_URL), "https://%s:%d/maprecv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
-    snprintf(SEND_URL, sizeof(SEND_URL), "https://%s:%d/mapsend?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+//    snprintf(RECV_URL, sizeof(RECV_URL), "https://%s:%d/maprecv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+//    snprintf(SEND_URL, sizeof(SEND_URL), "https://%s:%d/mapsend?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+
+    snprintf(RECV_URL, sizeof(RECV_URL), "https://%s:%d/recv?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
+    snprintf(SEND_URL, sizeof(SEND_URL), "https://%s:%d/send?client_id=%s", SERVER_ADDRESS, SERVER_PORT, uuid);
     //printf("revc:  %s\nsend:   %s\n", RECV_URL, SEND_URL);
     struct MemoryStruct chunk;
     chunk.dynamic_memory = NULL;
@@ -970,12 +982,13 @@ int main(int argc, char *argv[]) {
 #endif
     initialize_curl();
     initializeTable();
-    snprintf(CLOSE_URL, sizeof(CLOSE_URL), "https://%s:%d/mapclose", SERVER_ADDRESS, SERVER_PORT);
+    //snprintf(CLOSE_URL, sizeof(CLOSE_URL), "https://%s:%d/mapclose", SERVER_ADDRESS, SERVER_PORT);
+    snprintf(CLOSE_URL, sizeof(CLOSE_URL), "https://%s:%d/close", SERVER_ADDRESS, SERVER_PORT);
     CurlPool *pool = curl_pool_init();
     CURL *infocurl = get_curl(pool);
-    while (TRUE){
-        //fetch_and_connect(infocurl ,pool);
-        fetch_map_and_connect(infocurl, pool);
+    while (true){
+        fetch_and_connect(infocurl ,pool);
+        //fetch_map_and_connect(infocurl, pool);
         sleep(1);
     }
     cleanup_curl();

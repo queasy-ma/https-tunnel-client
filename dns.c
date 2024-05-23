@@ -78,4 +78,3 @@ int gethostbydomain(const char *domain, char *ipAddrBuf, int size)
 #endif
     return ret;
 }
-
